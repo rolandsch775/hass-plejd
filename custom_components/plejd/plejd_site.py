@@ -60,8 +60,8 @@ class PlejdSite:
         try:
             import time
             import types
+            import asyncio
 
-            # Automatically locate the mesh writing mechanism across library variations
             target_obj = None
             method_name = None
             if hasattr(self.manager, "write_mesh"):
@@ -81,14 +81,11 @@ class PlejdSite:
                 async def patched_write(*args, **kwargs):
                     nonlocal last_write_payload, last_write_time
                     
-                    # Unpack payload seamlessly regardless of wrapper types (tuples, lists, or strings)
-                    payload = args[0] if args else kwargs.get("payload") or kwargs.get("data")
+                    payload = args if args else kwargs.get("payload") or kwargs.get("data")
                     payload_str = str(payload).strip("()',[] ")
 
-                    # Safety check: ONLY target the specific 10-character button re-arm frame strings
                     if "00011000" in payload_str and len(payload_str) <= 12:
                         now = time.time()
-                        # If the exact same switch re-arm fires twice under 350ms, kill the loop instantly
                         if payload_str == last_write_payload and (now - last_write_time) < 0.35:
                             _LOGGER.warning("Plejd Safety: Defused duplicate switch loop event for payload: %s", payload_str)
                             return True
@@ -96,7 +93,6 @@ class PlejdSite:
                         last_write_payload = payload_str
                         last_write_time = now
 
-                    # Execute natively without adding any artificial delay to dimmers or sliders
                     if asyncio.iscoroutinefunction(orig_method):
                         return await orig_method(*args, **kwargs)
                     return orig_method(*args, **kwargs)
