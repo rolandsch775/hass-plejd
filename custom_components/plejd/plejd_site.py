@@ -61,7 +61,6 @@ class PlejdSite:
             import time
             import types
             import asyncio
-
             target_obj = None
             method_name = None
             if hasattr(self.manager, "write_mesh"):
@@ -70,33 +69,40 @@ class PlejdSite:
             elif hasattr(self.manager, "mesh") and hasattr(self.manager.mesh, "write"):
                 target_obj = self.manager.mesh
                 method_name = "write"
-
+            
             if target_obj and method_name:
                 orig_method = getattr(target_obj, method_name)
-                _LOGGER.info("Plejd Safety: Anti-loop shield successfully active on %s.%s", type(target_obj).__name__, method_name)
+                _LOGGER.info("Plejd Safety: Anti-loop & Concurrency shield successfully active on %s.%s",
+                             type(target_obj).__name__, method_name)
                 
                 last_write_payload = None
                 last_write_time = 0
-
+                
+                # Allows parallel flights while preventing proxy queue saturation
+                write_semaphore = asyncio.Semaphore(3)
+                
                 async def patched_write(*args, **kwargs):
                     nonlocal last_write_payload, last_write_time
-                    
                     payload = args if args else kwargs.get("payload") or kwargs.get("data")
                     payload_str = str(payload).strip("()',[] ")
-
+                    
+                    # Strictly defuse duplicate switch bounces from WPH-01 hardware
                     if "0001100015" in payload_str and len(payload_str) <= 12:
                         now = time.time()
                         if payload_str == last_write_payload and (now - last_write_time) < 0.35:
                             _LOGGER.warning("Plejd Safety: Defused duplicate switch loop event for payload: %s", payload_str)
                             return True
-                        
-                        last_write_payload = payload_str
-                        last_write_time = now
-
-                    if asyncio.iscoroutinefunction(orig_method):
-                        return await orig_method(*args, **kwargs)
-                    return orig_method(*args, **kwargs)
-
+                    
+                    last_write_payload = payload_str
+                    last_write_time = time.time()
+                    
+                    # Process through the safety flight slots and add a micro-pacing gap
+                    async with write_semaphore:
+                        res = await orig_method(*args, **kwargs) if asyncio.iscoroutinefunction(orig_method) else orig_method(*args, **kwargs)
+                        # A 15ms delay ensures packets don't pile up in the same millisecond slot
+                        await asyncio.sleep(0.015)
+                        return res
+                
                 setattr(target_obj, method_name, patched_write)
         except Exception as shield_err:
             _LOGGER.error("Plejd Safety: Failed to initialize shield: %s", shield_err)
