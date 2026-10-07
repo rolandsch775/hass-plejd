@@ -57,6 +57,54 @@ class PlejdSite:
 
         self.manager: PlejdManager = PlejdManager(**self.credentials)
 
+        try:
+            import time
+            import types
+
+            # Automatically locate the mesh writing mechanism across library variations
+            target_obj = None
+            method_name = None
+            if hasattr(self.manager, "write_mesh"):
+                target_obj = self.manager
+                method_name = "write_mesh"
+            elif hasattr(self.manager, "mesh") and hasattr(self.manager.mesh, "write"):
+                target_obj = self.manager.mesh
+                method_name = "write"
+
+            if target_obj and method_name:
+                orig_method = getattr(target_obj, method_name)
+                _LOGGER.info("Plejd Safety: Anti-loop shield successfully active on %s.%s", type(target_obj).__name__, method_name)
+                
+                last_write_payload = None
+                last_write_time = 0
+
+                async def patched_write(*args, **kwargs):
+                    nonlocal last_write_payload, last_write_time
+                    
+                    # Unpack payload seamlessly regardless of wrapper types (tuples, lists, or strings)
+                    payload = args[0] if args else kwargs.get("payload") or kwargs.get("data")
+                    payload_str = str(payload).strip("()',[] ")
+
+                    # Safety check: ONLY target the specific 10-character button re-arm frame strings
+                    if "00011000" in payload_str and len(payload_str) <= 12:
+                        now = time.time()
+                        # If the exact same switch re-arm fires twice under 350ms, kill the loop instantly
+                        if payload_str == last_write_payload and (now - last_write_time) < 0.35:
+                            _LOGGER.warning("Plejd Safety: Defused duplicate switch loop event for payload: %s", payload_str)
+                            return True
+                        
+                        last_write_payload = payload_str
+                        last_write_time = now
+
+                    # Execute natively without adding any artificial delay to dimmers or sliders
+                    if asyncio.iscoroutinefunction(orig_method):
+                        return await orig_method(*args, **kwargs)
+                    return orig_method(*args, **kwargs)
+
+                setattr(target_obj, method_name, patched_write)
+        except Exception as shield_err:
+            _LOGGER.error("Plejd Safety: Failed to initialize shield: %s", shield_err)
+
         self.devices: list[dt.PlejdDevice] = []
 
         self.started = False
