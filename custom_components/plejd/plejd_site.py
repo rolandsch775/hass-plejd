@@ -84,7 +84,7 @@ class PlejdSite:
                     payload = args if args else kwargs.get("payload") or kwargs.get("data")
                     payload_str = str(payload).strip("()',[] ")
 
-                    if "00011000" in payload_str and len(payload_str) <= 12:
+                    if "0001100015" in payload_str and len(payload_str) <= 12:
                         now = time.time()
                         if payload_str == last_write_payload and (now - last_write_time) < 0.35:
                             _LOGGER.warning("Plejd Safety: Defused duplicate switch loop event for payload: %s", payload_str)
