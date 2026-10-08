@@ -1,5 +1,7 @@
 """Plejd entity helpers."""
 
+import logging
+
 from homeassistant.core import callback, HomeAssistant
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers import device_registry as dr
@@ -7,6 +9,31 @@ from homeassistant.const import EntityCategory
 
 from .const import DOMAIN, MANUFACTURER
 from .plejd_site import dt
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def device_info(hass: HomeAssistant, device: dt.PlejdDevice, config_entry_id: str):
+    info = {
+        "identifiers": {(DOMAIN, device.device_identifier)},
+        "name": device.name,
+        "manufacturer": MANUFACTURER,
+        "model": device.hardware,
+        "suggested_area": device.room,
+        "sw_version": str(device.firmware),
+    }
+    if not device.parent_identifier == device.device_identifier:
+        parent = dr.async_get(hass).async_get_device_by_identifier(
+            (DOMAIN, device.parent_identifier),
+            config_entry_id,
+        )
+
+        if parent is not None:
+            info["via_device_id"] = parent.id
+    else:
+        info["connections"] = {(dr.CONNECTION_BLUETOOTH, device.ble_mac)}
+
+    return info
 
 
 class PlejdDeviceBaseEntity(Entity):
@@ -25,23 +52,7 @@ class PlejdDeviceBaseEntity(Entity):
     @property
     def device_info(self):
         """Return a device description for device registry."""
-        info = {
-            "identifiers": {(DOMAIN, self.device.device_identifier)},
-            "name": self.device.name,
-            "manufacturer": MANUFACTURER,
-            "model": f"{self.device.hardware}",
-            "suggested_area": self.device.room,
-            "sw_version": str(self.device.firmware),
-        }
-        if not self.device.parent_identifier == self.device.device_identifier:
-            parent = dr.async_get(self.hass).async_get_device_by_identifier(
-                (DOMAIN, self.device.parent_identifier),
-                self.platform.config_entry.entry_id,
-            )
-            # Parent not registered (yet): leave any existing link untouched.
-            if parent is not None:
-                info["via_device_id"] = parent.id
-        return info
+        return device_info(self.hass, self.device, self.platform.config_entry.entry_id)
 
     @property
     def unique_id(self):
@@ -88,14 +99,6 @@ class PlejdDeviceDiagnosticEntity(PlejdDeviceBaseEntity):
     _id_suffix = "diagnostic"
 
     @property
-    def device_info(self):
-        """Return a device description for device registry."""
-        info = super().device_info
-        info["connections"] = {(dr.CONNECTION_BLUETOOTH, self.device.ble_mac)}
-
-        return info
-
-    @property
     def unique_id(self):
         """Return unique identifier for the entity."""
         return ":".join(self.device.identifier) + self._id_suffix
@@ -127,11 +130,43 @@ def register_unknown_device(
     device_registry = dr.async_get(hass)
     device_registry.async_get_or_create(
         config_entry_id=config_entry_id,
-        identifiers={(DOMAIN, device.device_identifier)},
-        manufacturer=MANUFACTURER,
-        name=device.name,
-        model=device.hardware,
-        suggested_area=device.room,
-        sw_version=str(device.firmware),
-        connections={(dr.CONNECTION_BLUETOOTH, device.ble_mac)},
+        **device_info(hass, device, config_entry_id),
     )
+
+
+@callback
+def migrate_device_registry(
+    hass: HomeAssistant, devices: list[dt.PlejdDevice], config_entry_id: str
+):
+    """Make sure the Bluetooth connection belongs to the primary device.
+
+    Earlier versions attached the Bluetooth connection of a multi-output unit
+    (DIM-02, REL-02, ...) to whichever output happened to carry the
+    diagnostic entities. The connection is now always registered on the
+    primary output's device, and Home Assistant refuses to register the same
+    connection twice within one config entry. Move it before the platforms
+    try to register their devices, instead of failing the whole setup.
+    """
+    registry = dr.async_get(hass)
+    for device in devices:
+        if not getattr(device, "is_primary", False):
+            continue
+        if not (ble_mac := getattr(device, "ble_mac", None)):
+            continue
+        connection = (dr.CONNECTION_BLUETOOTH, ble_mac)
+        owner = registry.async_get_device(connections={connection})
+        if owner is None:
+            continue
+        if (DOMAIN, device.device_identifier) in owner.identifiers:
+            continue
+        if config_entry_id not in owner.config_entries:
+            continue
+        _LOGGER.info(
+            "Moving Bluetooth connection %s from device '%s' to the primary device '%s'",
+            ble_mac,
+            owner.name_by_user or owner.name,
+            device.name,
+        )
+        registry.async_update_device(
+            owner.id, new_connections=owner.connections - {connection}
+        )
